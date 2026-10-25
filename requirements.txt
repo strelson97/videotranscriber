@@ -1,5 +1,6 @@
 flask
-yt-dlp
+yt-dlp[default,curl-cffi]
+deno
 deep-translator
 requests
 gunicorn
