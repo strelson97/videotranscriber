@@ -1,0 +1,255 @@
+"""
+Транскрибатор видео по ссылке (YouTube, Instagram, TikTok, X и ещё ~1000 сайтов).
+Ссылка -> скачивание аудио (yt-dlp) -> распознавание речи (Whisper) -> перевод на 40+ языков.
+
+Запуск:  python app.py   ->  открыть http://localhost:5000
+"""
+import os
+import shutil
+import tempfile
+import time
+import threading
+
+import yt_dlp
+from deep_translator import GoogleTranslator
+import requests
+from flask import Flask, jsonify, render_template_string, request
+
+app = Flask(__name__)
+
+# Файл cookies.txt нужен для приватных/закрытых видео и для Instagram (экспорт из браузера)
+def _find_cookies():
+    for p in (os.environ.get("COOKIES_FILE", ""), "cookies.txt", "/etc/secrets/cookies.txt"):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+COOKIES_FILE = _find_cookies()
+
+LANGUAGES = {
+    "ru": "Русский", "en": "English", "es": "Español", "fr": "Français", "de": "Deutsch",
+    "it": "Italiano", "pt": "Português", "zh-CN": "中文 (упрощённый)", "zh-TW": "中文 (традиционный)",
+    "ja": "日本語", "ko": "한국어", "ar": "العربية", "hi": "हिन्दी", "tr": "Türkçe", "pl": "Polski",
+    "uk": "Українська", "nl": "Nederlands", "sv": "Svenska", "no": "Norsk", "da": "Dansk",
+    "fi": "Suomi", "cs": "Čeština", "el": "Ελληνικά", "iw": "עברית", "hu": "Magyar",
+    "ro": "Română", "bg": "Български", "sr": "Српски", "hr": "Hrvatski", "sk": "Slovenčina",
+    "id": "Bahasa Indonesia", "ms": "Bahasa Melayu", "th": "ไทย", "vi": "Tiếng Việt",
+    "fa": "فارسی", "bn": "বাংলা", "ur": "اردو", "kk": "Қазақша", "uz": "Oʻzbekcha",
+    "az": "Azərbaycanca", "ka": "ქართული", "hy": "Հայերեն",
+}
+
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+
+
+def friendly_error(msg):
+    m = msg.lower()
+    if "confirm you" in m and "bot" in m or "sign in" in m:
+        return ("YouTube/сайт требует вход и блокирует запросы с сервера. "
+                "Попробуйте другое видео или добавьте cookies.txt (см. инструкцию).")
+    if "failed to extract any player response" in m or "player response" in m:
+        return ("YouTube не отдал видео этому серверу (частая блокировка хостингов). "
+                "Для TikTok и Instagram это обычно не проблема.")
+    if "private" in m or "login required" in m or "rate-limit" in m or "not available" in m:
+        return "Видео закрытое, удалено или сайт ограничил доступ. Нужны публичные видео."
+    if "unsupported url" in m:
+        return "Эта ссылка не поддерживается. Вставьте ссылку на сам ролик."
+    return msg
+
+
+def download_audio(url, folder):
+    base = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 3,
+    }
+    if COOKIES_FILE:
+        base["cookiefile"] = COOKIES_FILE
+    # Несколько способов подключения: YouTube часто блокирует какой-то один из них
+    attempts = [
+        {},
+        {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+    ]
+    errors = []
+    for extra in attempts:
+        try:
+            with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info), info.get("title", "video")
+        except Exception as e:
+            errors.append(str(e)[:200])
+    raise RuntimeError("Не удалось скачать видео. " + " || ".join(errors[-2:]))
+
+
+def transcribe(path):
+    """Распознавание через Groq (Whisper large-v3-turbo). Лимит файла ~25 МБ."""
+    if not GROQ_KEY:
+        raise RuntimeError("Не задан GROQ_API_KEY на сервере")
+    if os.path.getsize(path) > 25 * 1024 * 1024:
+        raise RuntimeError("Аудио больше 25 МБ — видео слишком длинное")
+    with open(path, "rb") as f:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": "Bearer " + GROQ_KEY},
+            files={"file": (os.path.basename(path), f)},
+            data={"model": "whisper-large-v3-turbo", "response_format": "verbose_json"},
+            timeout=600,
+        )
+    if r.status_code != 200:
+        raise RuntimeError("Groq: " + r.text[:300])
+    j = r.json()
+    lines = [x["text"].strip() for x in j.get("segments", []) if x["text"].strip()]
+    return lines or [j.get("text", "")], j.get("language", "auto")
+
+
+def _chunks(lines, limit=3000):
+    batch, size = [], 0
+    for line in lines:
+        if batch and size + len(line) > limit:
+            yield batch
+            batch, size = [], 0
+        batch.append(line)
+        size += len(line) + 1
+    if batch:
+        yield batch
+
+
+TRANSLATE_MODELS = [m for m in [os.environ.get("GROQ_TRANSLATE_MODEL"),
+                                "llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+                                "openai/gpt-oss-20b"] if m]
+
+
+def _translate_groq(text, lang_name):
+    errors = []
+    for model in TRANSLATE_MODELS:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + GROQ_KEY},
+            json={
+                "model": model,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "You are a professional translator. Translate the user's text into "
+                     + lang_name + ". Keep the same number of lines and the line breaks. Output ONLY the translation."},
+                    {"role": "user", "content": text},
+                ],
+            },
+            timeout=120,
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        errors.append(model + ": " + r.text[:150])
+    raise RuntimeError(" | ".join(errors))
+
+
+def _translate_google(text, target):
+    last = None
+    for i in range(3):
+        try:
+            return GoogleTranslator(source="auto", target=target).translate(text)
+        except Exception as e:
+            last = e
+            time.sleep(2 * (i + 1))
+    raise last
+
+
+def translate(lines, src, target):
+    """Сначала Groq (LLM), при сбое - бесплатный переводчик Google."""
+    out = []
+    lang_name = LANGUAGES.get(target, target)
+    for batch in _chunks(lines):
+        text = "\n".join(batch)
+        try:
+            res = _translate_groq(text, lang_name)
+        except Exception as e1:
+            try:
+                res = _translate_google(text, target)
+            except Exception as e2:
+                raise RuntimeError("Перевод не удался. Groq: " + str(e1)[:300] + " || Google: " + str(e2)[:120])
+        out.extend(res.split("\n"))
+    return out
+
+
+@app.post("/api/process")
+def process():
+    data = request.get_json(force=True)
+    urls = [u.strip() for u in data.get("urls", []) if u.strip()]
+    target = data.get("lang", "ru")
+    results = []
+    for url in urls:
+        folder = tempfile.mkdtemp()
+        try:
+            path, title = download_audio(url, folder)
+            lines, lang = transcribe(path)
+            try:
+                translated = "\n".join(translate(lines, "auto", target))
+            except Exception as e:
+                translated = "[Перевод не получился] " + str(e)
+            results.append({"url": url, "title": title, "detected": lang,
+                            "original": "\n".join(lines), "translated": translated})
+        except Exception as e:  # показываем понятную ошибку по каждой ссылке
+            results.append({"url": url, "error": friendly_error(str(e))})
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+    return jsonify(results)
+
+
+PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Транскрибатор видео</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:900px;margin:30px auto;padding:0 16px;background:#f6f7f9;color:#222}
+textarea,select,button{font:inherit;padding:10px;border-radius:8px;border:1px solid #ccc;width:100%;box-sizing:border-box}
+textarea{height:110px}.row{display:flex;gap:10px;margin:10px 0}button{background:#2b6cff;color:#fff;border:0;cursor:pointer}
+.card{background:#fff;border-radius:12px;padding:16px;margin:16px 0;box-shadow:0 1px 4px #0001}
+pre{white-space:pre-wrap;background:#f0f2f5;padding:12px;border-radius:8px}small{color:#666}
+</style></head><body>
+<h1>🎬 Транскрибатор видео</h1>
+<textarea id="urls" placeholder="Вставьте ссылки на YouTube / Instagram / TikTok — по одной на строку"></textarea>
+<div class="row">
+<select id="lang">{% for c,n in langs.items() %}<option value="{{c}}">{{n}}</option>{% endfor %}</select>
+</div>
+<button id="go">Транскрибировать и перевести</button>
+<p><small>Язык видео определяется автоматически. Перевод — на выбранный язык.</small></p>
+<div id="out"></div>
+<script>
+const out=document.getElementById('out'),go=document.getElementById('go');
+function dl(name,text){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));a.download=name;a.click()}
+go.onclick=async()=>{
+  const urls=document.getElementById('urls').value.split('\\n').filter(x=>x.trim());
+  if(!urls.length)return;
+  go.disabled=true;go.textContent='Работаю… (длинные видео занимают время)';out.innerHTML='';
+  try{
+    const r=await fetch('/api/process',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({urls,lang:lang.value})});
+    for(const x of await r.json()){
+      const c=document.createElement('div');c.className='card';
+      const h=document.createElement('h3');h.textContent=x.title||x.url;c.append(h);
+      if(x.error){const p=document.createElement('p');p.textContent='Ошибка: '+x.error;c.append(p)}
+      else{
+        const s=document.createElement('small');s.textContent='Определён язык: '+x.detected;c.append(s);
+        for(const [label,t] of [['Перевод',x.translated],['Оригинал',x.original]]){
+          const b=document.createElement('b');b.textContent=label;const pre=document.createElement('pre');pre.textContent=t;
+          const bt=document.createElement('button');bt.textContent='Скачать .txt';bt.style.width='auto';
+          bt.onclick=()=>dl(label+'.txt',t);c.append(document.createElement('br'),b,pre,bt);
+        }
+      }
+      out.append(c);
+    }
+  }catch(e){out.textContent='Ошибка: '+e}
+  go.disabled=false;go.textContent='Транскрибировать и перевести';
+};
+</script></body></html>"""
+
+
+@app.get("/")
+def index():
+    return render_template_string(PAGE, langs=LANGUAGES)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 7860)))
