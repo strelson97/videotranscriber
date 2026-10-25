@@ -18,7 +18,14 @@ from flask import Flask, jsonify, render_template_string, request
 app = Flask(__name__)
 
 # Файл cookies.txt нужен для приватных/закрытых видео и для Instagram (экспорт из браузера)
-COOKIES_FILE = os.environ.get("COOKIES_FILE", "cookies.txt")
+def _find_cookies():
+    for p in (os.environ.get("COOKIES_FILE", ""), "cookies.txt", "/etc/secrets/cookies.txt"):
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+COOKIES_FILE = _find_cookies()
 
 LANGUAGES = {
     "ru": "Русский", "en": "English", "es": "Español", "fr": "Français", "de": "Deutsch",
@@ -35,22 +42,51 @@ LANGUAGES = {
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
 
+def friendly_error(msg):
+    m = msg.lower()
+    if "confirm you" in m and "bot" in m or "sign in" in m:
+        return ("YouTube/сайт требует вход и блокирует запросы с сервера. "
+                "Попробуйте другое видео или добавьте cookies.txt (см. инструкцию).")
+    if "failed to extract any player response" in m or "player response" in m:
+        return ("YouTube не отдал видео этому серверу (частая блокировка хостингов). "
+                "Для TikTok и Instagram это обычно не проблема.")
+    if "private" in m or "login required" in m or "rate-limit" in m or "not available" in m:
+        return "Видео закрытое, удалено или сайт ограничил доступ. Нужны публичные видео."
+    if "unsupported url" in m:
+        return "Эта ссылка не поддерживается. Вставьте ссылку на сам ролик."
+    return msg
+
+
 def download_audio(url, folder):
-    opts = {
+    base = {
         "format": "bestaudio/best",
         "outtmpl": os.path.join(folder, "%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
     }
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info), info.get("title", "video")
+    if COOKIES_FILE:
+        base["cookiefile"] = COOKIES_FILE
+    # Несколько способов подключения: YouTube часто блокирует какой-то один из них
+    attempts = [
+        {},
+        {"extractor_args": {"youtube": {"player_client": ["tv", "web_safari"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}},
+        {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+    ]
+    errors = []
+    for extra in attempts:
+        try:
+            with yt_dlp.YoutubeDL({**base, **extra}) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info), info.get("title", "video")
+        except Exception as e:
+            errors.append(str(e)[:200])
+    raise RuntimeError("Не удалось скачать видео. " + " || ".join(errors[-2:]))
 
 
-def transcribe(path, size):
+def transcribe(path):
     """Распознавание через Groq (Whisper large-v3-turbo). Лимит файла ~25 МБ."""
     if not GROQ_KEY:
         raise RuntimeError("Не задан GROQ_API_KEY на сервере")
@@ -144,13 +180,12 @@ def process():
     data = request.get_json(force=True)
     urls = [u.strip() for u in data.get("urls", []) if u.strip()]
     target = data.get("lang", "ru")
-    size = data.get("model", "small")
     results = []
     for url in urls:
         folder = tempfile.mkdtemp()
         try:
             path, title = download_audio(url, folder)
-            lines, lang = transcribe(path, size)
+            lines, lang = transcribe(path)
             try:
                 translated = "\n".join(translate(lines, "auto", target))
             except Exception as e:
@@ -158,7 +193,7 @@ def process():
             results.append({"url": url, "title": title, "detected": lang,
                             "original": "\n".join(lines), "translated": translated})
         except Exception as e:  # показываем понятную ошибку по каждой ссылке
-            results.append({"url": url, "error": str(e)})
+            results.append({"url": url, "error": friendly_error(str(e))})
         finally:
             shutil.rmtree(folder, ignore_errors=True)
     return jsonify(results)
@@ -177,8 +212,7 @@ pre{white-space:pre-wrap;background:#f0f2f5;padding:12px;border-radius:8px}small
 <textarea id="urls" placeholder="Вставьте ссылки на YouTube / Instagram / TikTok — по одной на строку"></textarea>
 <div class="row">
 <select id="lang">{% for c,n in langs.items() %}<option value="{{c}}">{{n}}</option>{% endfor %}</select>
-<select id="model"><option value="base">Быстро (base)</option><option value="small" selected>Баланс (small)</option>
-<option value="medium">Точно (medium)</option><option value="large-v3">Максимум (large-v3)</option></select></div>
+</div>
 <button id="go">Транскрибировать и перевести</button>
 <p><small>Язык видео определяется автоматически. Перевод — на выбранный язык.</small></p>
 <div id="out"></div>
@@ -191,7 +225,7 @@ go.onclick=async()=>{
   go.disabled=true;go.textContent='Работаю… (длинные видео занимают время)';out.innerHTML='';
   try{
     const r=await fetch('/api/process',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({urls,lang:lang.value,model:model.value})});
+      body:JSON.stringify({urls,lang:lang.value})});
     for(const x of await r.json()){
       const c=document.createElement('div');c.className='card';
       const h=document.createElement('h3');h.textContent=x.title||x.url;c.append(h);
