@@ -7,6 +7,7 @@
 import os
 import shutil
 import tempfile
+import time
 import threading
 
 import yt_dlp
@@ -70,22 +71,71 @@ def transcribe(path, size):
     return lines or [j.get("text", "")], j.get("language", "auto")
 
 
-def translate(lines, src, target):
-    """Переводит пачками (лимит ~5000 символов на запрос)."""
-    out, batch, size = [], [], 0
-    tr = GoogleTranslator(source="auto", target=target)
-
-    def flush():
-        if batch:
-            out.extend(tr.translate("\n".join(batch)).split("\n"))
-
+def _chunks(lines, limit=3000):
+    batch, size = [], 0
     for line in lines:
-        if size + len(line) > 4000:
-            flush()
+        if batch and size + len(line) > limit:
+            yield batch
             batch, size = [], 0
         batch.append(line)
         size += len(line) + 1
-    flush()
+    if batch:
+        yield batch
+
+
+TRANSLATE_MODELS = [m for m in [os.environ.get("GROQ_TRANSLATE_MODEL"),
+                                "llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+                                "openai/gpt-oss-20b"] if m]
+
+
+def _translate_groq(text, lang_name):
+    errors = []
+    for model in TRANSLATE_MODELS:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + GROQ_KEY},
+            json={
+                "model": model,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": "You are a professional translator. Translate the user's text into "
+                     + lang_name + ". Keep the same number of lines and the line breaks. Output ONLY the translation."},
+                    {"role": "user", "content": text},
+                ],
+            },
+            timeout=120,
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip()
+        errors.append(model + ": " + r.text[:150])
+    raise RuntimeError(" | ".join(errors))
+
+
+def _translate_google(text, target):
+    last = None
+    for i in range(3):
+        try:
+            return GoogleTranslator(source="auto", target=target).translate(text)
+        except Exception as e:
+            last = e
+            time.sleep(2 * (i + 1))
+    raise last
+
+
+def translate(lines, src, target):
+    """Сначала Groq (LLM), при сбое - бесплатный переводчик Google."""
+    out = []
+    lang_name = LANGUAGES.get(target, target)
+    for batch in _chunks(lines):
+        text = "\n".join(batch)
+        try:
+            res = _translate_groq(text, lang_name)
+        except Exception as e1:
+            try:
+                res = _translate_google(text, target)
+            except Exception as e2:
+                raise RuntimeError("Перевод не удался. Groq: " + str(e1)[:300] + " || Google: " + str(e2)[:120])
+        out.extend(res.split("\n"))
     return out
 
 
@@ -101,9 +151,12 @@ def process():
         try:
             path, title = download_audio(url, folder)
             lines, lang = transcribe(path, size)
-            translated = translate(lines, "auto", target)
+            try:
+                translated = "\n".join(translate(lines, "auto", target))
+            except Exception as e:
+                translated = "[Перевод не получился] " + str(e)
             results.append({"url": url, "title": title, "detected": lang,
-                            "original": "\n".join(lines), "translated": "\n".join(translated)})
+                            "original": "\n".join(lines), "translated": translated})
         except Exception as e:  # показываем понятную ошибку по каждой ссылке
             results.append({"url": url, "error": str(e)})
         finally:
